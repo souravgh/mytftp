@@ -1,0 +1,375 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"net"
+	"time"
+)
+
+const (
+	TIMED = 600
+)
+
+const (
+	PORT_NUM = 6000
+)
+
+type myCursor struct {
+	fileName string
+	curBlock uint16
+	curAck   uint16
+	op       uint8
+	ackZero  bool
+	mFile    *myFile
+}
+
+type myConnector struct {
+	remoteAddr *net.UDPAddr
+	conn       *net.UDPConn
+	log        *log.Logger
+	status     myCursor
+}
+
+func (c *myConnector) timedReadFromUDP(buf []byte) (nm int,
+	raddr *net.UDPAddr, rerr error) {
+
+	c.conn.SetDeadline(time.Now().Add(TIMED * time.Second))
+
+	n, addr, err := c.conn.ReadFromUDP(buf)
+	if err != nil {
+		if nerr, ok := err.(net.Error); ok &&
+			nerr.Temporary() {
+			/* Handle temporary errors. */
+			fmt.Println("temp error receiving Data", err)
+			time.Sleep(time.Second * 1)
+			rerr = nil
+			nm = 0
+		} else {
+			fmt.Println("error receiving Data", err)
+			fmt.Println(err)
+			rerr = err
+			nm = 0
+		}
+	} else {
+		nm = n
+		raddr = addr
+		rerr = err
+	}
+	return
+}
+
+/*
+* File Sender routine.
+* XXX: We should start with curAck set to -1, which means we have not
+* received ACK for 0 block (for client) yet.
+* curBlock -> Currently sent block
+* curAck -> Currently acknowledged block from the receiver
+ */
+func (tx *myConnector) txSend(isServer bool) {
+	bufAck := make([]byte, BLOCK_SIZE)
+	tx.status.curBlock = 0
+	tx.status.curAck = 0
+	tx.status.ackZero = false // Special case: Should have a negative Ack instead
+	myReader := tx.status.mFile.startReader()
+
+	var fileBlock []byte
+	bufLen := DATA_SIZE
+
+	for {
+		if !isServer || tx.status.curBlock != 0 {
+
+			n, addr, err := tx.timedReadFromUDP(bufAck)
+
+			tx.conn.SetDeadline(time.Now().Add(TIMED * time.Second))
+			n, addr, err := tx.conn.ReadFromUDP(bufAck)
+			if err != nil {
+				if nerr, ok := err.(net.Error); ok &&
+					nerr.Temporary() {
+					fmt.Println("temp error receiving Ack",
+						err)
+					time.Sleep(time.Second * 1)
+					/* Must recv the first ACK. */
+					if tx.status.curAck == 0 {
+						continue
+					}
+				} else {
+					fmt.Println("error receiving Ack", err)
+					return
+				}
+			} else {
+				/* No error, got an ACK!. */
+				if !isServer && tx.status.curAck == 0 {
+					tx.remoteAddr = addr
+				}
+
+				pkt := parsePkt(bufAck, n)
+				log.Printf("Received pkt: ")
+				log.Println(" from ", addr)
+
+				switch p := pkt.(type) {
+				case *myAck:
+					log.Println("Got Ack packet\n", p)
+					log.Println("Block num in ack :",
+						p.blockNum, ", cur block num:",
+						tx.status.curBlock)
+
+					/* Set for later ACK only.
+					* Check if ackZero is done already.
+					 */
+					if tx.status.ackZero &&
+						tx.status.curAck >= p.blockNum {
+						continue
+					} else {
+						tx.status.ackZero = true
+						tx.status.curAck = p.blockNum
+					}
+				case *myErr:
+					log.Println("Got Err packet\n", p)
+					return
+				default:
+					log.Println("unexpected packet type", p)
+					return
+				}
+				if bufLen < DATA_SIZE {
+					log.Println("bufLen=", bufLen, "\n")
+					break
+				}
+			}
+		}
+
+		if tx.status.curBlock == tx.status.curAck {
+			tx.status.curBlock++
+			fileBlock, bufLen = tx.status.mFile.readMyFileBlock(
+				DATA_SIZE, myReader)
+		}
+
+		dataPkt := new(myDat)
+		fmt.Printf("Data len = %d\n", bufLen)
+		dataPkt.crtPkt(tx.status.curBlock, fileBlock, bufLen)
+		fmt.Printf("Data: %s\n", string(dataPkt.data))
+
+		tx.conn.SetDeadline(time.Now().Add(TIMED * time.Second))
+
+		_, err := tx.conn.WriteTo(dataPkt.sendPkt(),
+			tx.remoteAddr)
+		if err != nil {
+			log.Println("Could not send Data for !",
+				tx.status.curBlock, "remote Addr",
+				tx.remoteAddr)
+			/* Handle temporary errors. */
+			if nerr, ok := err.(net.Error); ok &&
+				nerr.Temporary() {
+				fmt.Println(
+					"temp error sending Data",
+					err)
+				time.Sleep(time.Second * 1)
+				continue
+			}
+			return
+		}
+	}
+}
+
+/*
+* File receiver routine
+ */
+func (rx *myConnector) rxRecv(isServer bool) {
+
+	rx.status.curBlock = 0
+	rx.status.curAck = 0
+	blockSize := BLOCK_SIZE
+
+	for {
+		// Send the first ACK from the server for block 0,
+		// followed by remaining acks.
+		if isServer || rx.status.curAck != 0 {
+			ack := new(myAck)
+			ack.blockNum = rx.status.curAck
+			rx.conn.SetDeadline(time.Now().Add(TIMED * time.Second))
+			_, err := rx.conn.WriteTo(ack.sendPkt(), rx.remoteAddr)
+			if err != nil {
+				log.Println("Could not send Ack:",
+					rx.status.curAck,
+					"remote addr", rx.remoteAddr)
+				/* Handle temporary errors. */
+				if nerr, ok := err.(net.Error); ok &&
+					nerr.Temporary() {
+					fmt.Println(
+						"temp error sending Ack",
+						err)
+					time.Sleep(time.Second * 1)
+
+					/* Must send the first ACK. */
+					if rx.status.curAck == 0 {
+						continue
+					}
+				}
+				return
+			}
+		}
+
+		log.Printf("Last block size : %d\n", blockSize)
+		// Quit if last block size was less than BLOCK_SIZE
+		if blockSize < BLOCK_SIZE {
+			break
+		}
+
+		rx.conn.SetDeadline(time.Now().Add(TIMED * time.Second))
+		buf := make([]byte, BLOCK_SIZE)
+		n, addr, err := rx.conn.ReadFromUDP(buf)
+		if err != nil {
+			if nerr, ok := err.(net.Error); ok &&
+				nerr.Temporary() {
+				fmt.Println("temp error receiving Data", err)
+				time.Sleep(time.Second * 1)
+				continue
+			} else {
+				fmt.Println("error receiving Data", err)
+				fmt.Println(err)
+				return
+			}
+		}
+
+		if !isServer && rx.status.curBlock == 0 && err == nil {
+			rx.remoteAddr = addr
+		}
+
+		pkt := parsePkt(buf, n)
+		log.Printf("Received pkt: len %d", n)
+		log.Println(" from ", rx.remoteAddr)
+		blockSize = 0
+		switch p := pkt.(type) {
+		case *myDat:
+			log.Println("Got Data packet\n")
+			log.Println("Block num: ", p.blockNum)
+			fmt.Printf("Data: %s\n", string(p.data))
+
+			blockSize = n
+			if rx.status.curAck >= p.blockNum {
+				log.Println("Got data pkt already ACKed",
+					"cur Ack:", rx.status.curAck,
+					", block Num:",
+					p.blockNum, "\n")
+				continue
+			}
+			rx.status.curBlock = p.blockNum
+			rx.status.mFile.writeMyFile(p.readPkt())
+
+			rx.status.curAck = rx.status.curBlock
+		default:
+			log.Fatal("unexpected packet type", p)
+
+		}
+	}
+}
+
+type myClient struct {
+	myConnector
+}
+
+func (client *myClient) process(req *myReq, mFile *myFile, ip string) {
+
+	servAddr := net.UDPAddr{
+		Port: PORT_NUM,
+		IP:   net.ParseIP(ip),
+	}
+
+	myAddr, err := net.ResolveUDPAddr("udp", ":0")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	client.conn, err = net.ListenUDP("udp", myAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	_, err = client.conn.WriteToUDP(req.sendPkt(), &servAddr)
+	if err != nil {
+		fmt.Println(req.fileName, err)
+	}
+	fmt.Println("Remote Address :", servAddr)
+	fmt.Println("Local Address :", *myAddr)
+	client.status.op = req.op
+	client.status.fileName = req.fileName
+	client.status.mFile = mFile
+	client.status.curBlock = 0
+
+	switch client.status.op {
+	case OP_WRQ:
+		client.txSend(false)
+	case OP_RRQ:
+		client.rxRecv(false)
+	}
+}
+
+type myWorker struct {
+	myConnector
+}
+
+func (worker *myWorker) run(tid int, req *myReq, mDir *myDir,
+	cliAddr *net.UDPAddr) {
+
+	var mFile *myFile
+
+	log.Println("Client", cliAddr, "connected.")
+
+	myAddr, err := net.ResolveUDPAddr("udp", ":0")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	worker.conn, err = net.ListenUDP("udp", myAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	worker.remoteAddr = cliAddr
+	worker.status.fileName = req.fileName
+	worker.status.op = req.op
+
+	switch worker.status.op {
+	case OP_WRQ:
+		mFile = mDir.findFile(req.fileName)
+
+		if mFile != nil {
+			errp := new(myErr)
+			errp.errCode = ER_EEXIST
+			errp.errMsg = "File already exists."
+			log.Println("File ", req.fileName, "already exists.")
+			_, err = worker.conn.WriteTo(errp.sendPkt(),
+				worker.remoteAddr)
+			if err != nil {
+				log.Println("Could not send first err packet!")
+			}
+			return
+		}
+
+		mFile = new(myFile)
+		mFile.fileName = req.fileName
+		mDir.addFile(mFile)
+		worker.status.mFile = mFile
+		worker.rxRecv(true)
+	case OP_RRQ:
+		mFile = mDir.findFile(req.fileName)
+
+		if mFile == nil {
+			log.Println("File ", req.fileName, "not found")
+
+			errp := new(myErr)
+			errp.errCode = ER_ENOENT
+			errp.errMsg = "File not found."
+			log.Println("File ", req.fileName, "not found.")
+			_, err = worker.conn.WriteTo(errp.sendPkt(),
+				worker.remoteAddr)
+			if err != nil {
+				log.Println("Could not send first err packet!")
+			}
+			return
+		}
+		worker.status.mFile = mFile
+		worker.txSend(true)
+	default:
+		log.Fatal("Unknown op", worker.status.op)
+	}
+}

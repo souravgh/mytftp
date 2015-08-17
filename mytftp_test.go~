@@ -1,0 +1,57 @@
+package main
+
+import (
+	"bytes"
+	"reflect"
+	"testing"
+)
+
+func testRRQReq(t *testing.T) {
+
+	req := new(myReq)
+	req.fileName = "testFile"
+	req.op = OP_RRQ
+
+	dataSend := reqPkt.sendPkt()
+
+	pkt := parsePkt(dataSend, BLOCK_SIZE)
+
+	switch p := pkt.(type) {
+	case *myReq:
+		if p.op != req.op {
+			t.Error("Expected RRQ opcode, got ", p.op)
+		}
+		if p.fileName != req.fileName {
+			t.Error("Expected fileName:", req.fileName, "got :",
+				p.fileName)
+		}
+	default:
+		t.Error("Expected req packet, got ", p)
+
+	}
+}
+
+func testWRQReq(t *testing.T) {
+
+	req := new(myReq)
+	req.fileName = "testFile"
+	req.op = OP_WRQ
+
+	dataSend := reqPkt.sendPkt()
+
+	pkt := parsePkt(dataSend, BLOCK_SIZE)
+
+	switch p := pkt.(type) {
+	case *myReq:
+		if p.op != req.op {
+			t.Error("Expected RRQ opcode, got ", p.op)
+		}
+		if p.fileName != req.fileName {
+			t.Error("Expected fileName:", req.fileName, "got :",
+				p.fileName)
+		}
+	default:
+		t.Error("Expected req packet, got ", p)
+
+	}
+}

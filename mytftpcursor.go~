@@ -1,0 +1,16 @@
+/* Contains status of the communication, from both client and server. */
+type myCursor struct {
+	fileName string
+	curBlock uint16
+	curAck   uint16
+	op       uint8
+	ackZero  bool
+	mFile    *myFile
+}
+
+const (
+	BAD_ACK = uint8(1) // Bad ACK packet
+	OLD_ACK = uint8(2) // ACK for old data packet
+	CUR_ACK = uint8(3) // ACK for the previous data packet
+	FIN_ACK = uint8(4) // ACK for the absolute last data packet
+)

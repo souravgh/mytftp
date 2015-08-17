@@ -1,0 +1,77 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"net"
+	"strconv"
+	"time"
+)
+
+func checkError(err error) {
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+}
+
+type myTftpClient struct {
+	remoteAddr *net.UDPAddr
+	Log        *log.Logger
+}
+
+func main() {
+
+	servAddr := net.UDPAddr{
+		Port: 6000,
+		IP:   net.ParseIP("127.0.0.1"),
+	}
+
+	myAddr, e := net.ResolveUDPAddr("udp", ":0")
+
+	conn, err := net.ListenUDP("udp", &myAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("Sending hadshake msg")
+
+	hostName := "127.0.0.1"
+	portNum := "6000"
+	//	ServerAddr, err := net.ResolveUDPAddr("udp", hostName+":"+portNum)
+	//	CheckError(err)
+	conn, err := net.Dial("udp", hostName+":"+portNum)
+	checkError(err)
+	defer conn.Close()
+
+	fmt.Printf("Connection established between %s and localhost.\n",
+		hostName)
+	fmt.Printf("Remote Address : %s \n", conn.RemoteAddr().String())
+	fmt.Printf("Local Address : %s \n", conn.LocalAddr().String())
+
+	//	addr, err := net.ResolveUDPAddr("udp", ":0")
+	//	if err != nil {
+	//		return err
+	//	}
+
+	msg := "XX"
+	buf := []byte(msg)
+	_, err = conn.Write(buf)
+	if err != nil {
+		fmt.Println(msg, err)
+	}
+	n, addr, err := conn.ReadFromUDP(buf)
+	if err != nil {
+		fmt.Println(msg, err)
+	}
+
+	for i := 0; i < 10; i++ {
+		msg := strconv.Itoa(i)
+		buf := []byte(msg)
+		_, err := conn.WriteTo(buf, addr)
+		if err != nil {
+			fmt.Println(msg, err)
+		}
+		time.Sleep(time.Second * 1)
+	}
+}
